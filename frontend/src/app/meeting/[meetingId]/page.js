@@ -21,12 +21,24 @@ function RemoteVideo({ stream, isVideoOn = true, style, muted }) {
 
   useEffect(() => {
     if (stream) {
-      if (videoRef.current) videoRef.current.srcObject = stream;
-      if (audioRef.current) audioRef.current.srcObject = stream;
-      
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.play().catch(() => {});
+      }
+      if (audioRef.current) {
+        audioRef.current.srcObject = stream;
+        audioRef.current.play().catch(() => {});
+      }
+
       const handleTrackChange = () => {
-        if (videoRef.current) videoRef.current.srcObject = stream;
-        if (audioRef.current) audioRef.current.srcObject = stream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.play().catch(() => {});
+        }
+        if (audioRef.current) {
+          audioRef.current.srcObject = stream;
+          audioRef.current.play().catch(() => {});
+        }
       };
       stream.addEventListener('addtrack', handleTrackChange);
       stream.addEventListener('removetrack', handleTrackChange);
