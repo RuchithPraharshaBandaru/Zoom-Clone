@@ -1,15 +1,11 @@
 /**
  * WebRTCManager — Robust Peer-to-Peer Media Engine.
  * 
- * Architecture:
- * - Uses in-memory Dummy Media (AudioContext silence + Canvas black frame) on initial connection.
- *   This gives 100% valid SDP m=audio and m=video lines across all devices WITHOUT touching
- *   the physical camera or microphone hardware on mount (no camera light, no mic recording).
- * - When user clicks Unmute / Start Video: browser requests real hardware, and sender.replaceTrack()
- *   instantly swaps the dummy track with the live hardware stream.
- * - When user clicks Mute / Stop Video: hardware track is stopped (turning off webcam light / mic),
- *   and swapped back to the in-memory dummy track.
- * - STUN + Free TURN servers ensure cross-network connectivity.
+ * Features:
+ * - Dynamic renegotiation: mic and camera hardware are ONLY activated on user click.
+ * - Connection persistence: peer connections are NEVER destroyed on renegotiation.
+ * - Dynamic addTrack / removeTrack / replaceTrack for seamless mute/unmute and camera toggles.
+ * - STUN + Free TURN relays for cross-network and symmetric NAT traversal.
  */
 
 const ICE_SERVERS = [
@@ -35,77 +31,22 @@ const ICE_SERVERS = [
   },
 ];
 
-/**
- * Creates in-memory silent audio and black canvas video tracks.
- * Uses 0 hardware devices, 0 permissions, 0 camera lights.
- */
-export function createDummyTracks() {
-  let dummyAudioTrack = null;
-  let dummyVideoTrack = null;
-
-  if (typeof window !== 'undefined') {
-    // 1. Silent audio track via Web Audio API (in-memory, 0 mic hardware)
-    try {
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      if (AudioCtx) {
-        const ctx = new AudioCtx();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        gain.gain.value = 0;
-        osc.connect(gain);
-        const dest = ctx.createMediaStreamDestination();
-        gain.connect(dest);
-        osc.start();
-        dummyAudioTrack = dest.stream.getAudioTracks()[0] || null;
-      }
-    } catch (e) {
-      console.warn('AudioContext dummy track creation failed:', e);
-    }
-
-    // 2. Black canvas video track (in-memory, 0 webcam hardware)
-    try {
-      const canvas = document.createElement('canvas');
-      canvas.width = 640;
-      canvas.height = 480;
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.fillStyle = '#000000';
-        ctx.fillRect(0, 0, 640, 480);
-      }
-      const stream = canvas.captureStream ? canvas.captureStream(10) : null;
-      dummyVideoTrack = stream ? stream.getVideoTracks()[0] : null;
-    } catch (e) {
-      console.warn('Canvas dummy track creation failed:', e);
-    }
-  }
-
-  const dummyStream = new MediaStream();
-  if (dummyAudioTrack) dummyStream.addTrack(dummyAudioTrack);
-  if (dummyVideoTrack) dummyStream.addTrack(dummyVideoTrack);
-
-  return { dummyStream, dummyAudioTrack, dummyVideoTrack };
-}
-
 export class WebRTCManager {
   constructor() {
-    this.peerConnections = new Map();
-    this.remoteStreams = new Map();
-    this.iceQueues = new Map();
+    this.peerConnections = new Map(); // remoteClientId -> RTCPeerConnection
+    this.remoteStreams = new Map();   // remoteClientId -> MediaStream
+    this.iceQueues = new Map();       // remoteClientId -> RTCIceCandidate[]
     this.ws = null;
     this.clientId = null;
+    this.localStream = null;
     this.onRemoteStreamsChanged = null;
     this._negotiating = new Set();
-    this.baseStream = null;
-    this.currentAudioTrack = null;
-    this.currentVideoTrack = null;
   }
 
-  init({ ws, clientId, baseStream, initialAudioTrack, initialVideoTrack, onRemoteStreamsChanged }) {
+  init({ ws, clientId, localStream, onRemoteStreamsChanged }) {
     this.ws = ws;
     this.clientId = String(clientId);
-    this.baseStream = baseStream;
-    this.currentAudioTrack = initialAudioTrack || null;
-    this.currentVideoTrack = initialVideoTrack || null;
+    this.localStream = localStream || new MediaStream();
     this.onRemoteStreamsChanged = onRemoteStreamsChanged;
   }
 
@@ -163,12 +104,11 @@ export class WebRTCManager {
       iceCandidatePoolSize: 10,
     });
 
-    // Add audio and video tracks from baseStream to generate real SDP media descriptions
-    if (this.currentAudioTrack && this.baseStream) {
-      pc.addTrack(this.currentAudioTrack, this.baseStream);
-    }
-    if (this.currentVideoTrack && this.baseStream) {
-      pc.addTrack(this.currentVideoTrack, this.baseStream);
+    // Add any existing local tracks
+    if (this.localStream) {
+      this.localStream.getTracks().forEach((track) => {
+        pc.addTrack(track, this.localStream);
+      });
     }
 
     // ICE Candidate trickle
@@ -218,7 +158,7 @@ export class WebRTCManager {
     // Connection Health Monitoring
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
-      console.log(`[WebRTC] peer ${remoteId} state: ${state}`);
+      console.log(`[WebRTC] peer ${remoteId} connection state: ${state}`);
       if (state === 'failed') {
         this.createOffer(remoteId);
       } else if (state === 'closed') {
@@ -245,8 +185,11 @@ export class WebRTCManager {
   async createOffer(remoteId) {
     this._negotiating.add(remoteId);
     try {
-      const pc = this.createPeerConnection(remoteId);
-      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      let pc = this.peerConnections.get(remoteId);
+      if (!pc || pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+        pc = this.createPeerConnection(remoteId);
+      }
+      const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       this.send({
         type: 'webrtc_offer',
@@ -254,6 +197,8 @@ export class WebRTCManager {
         targetId: remoteId,
         offer: pc.localDescription,
       });
+    } catch (err) {
+      console.warn('[WebRTC] createOffer error:', err);
     } finally {
       this._negotiating.delete(remoteId);
     }
@@ -262,7 +207,10 @@ export class WebRTCManager {
   async handleOffer(remoteId, offer) {
     this._negotiating.add(remoteId);
     try {
-      const pc = this.createPeerConnection(remoteId);
+      let pc = this.peerConnections.get(remoteId);
+      if (!pc || pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+        pc = this.createPeerConnection(remoteId);
+      }
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
       await this.drainIceCandidates(remoteId, pc);
 
@@ -274,6 +222,8 @@ export class WebRTCManager {
         targetId: remoteId,
         answer: pc.localDescription,
       });
+    } catch (err) {
+      console.warn('[WebRTC] handleOffer error:', err);
     } finally {
       this._negotiating.delete(remoteId);
     }
@@ -334,42 +284,59 @@ export class WebRTCManager {
   }
 
   /**
-   * Swap out the audio track across all active peer connections.
-   * If track is null, swaps back to dummyAudioTrack (silence).
+   * Add a new live track to all peer connections (triggers automatic renegotiation).
    */
-  async setAudioTrack(track, fallbackDummyTrack) {
-    const trackToSend = track || fallbackDummyTrack;
-    this.currentAudioTrack = trackToSend;
+  addTrackToPeers(track, stream) {
+    for (const [, pc] of this.peerConnections) {
+      try {
+        pc.addTrack(track, stream || this.localStream);
+      } catch (e) {
+        console.warn('[WebRTC] addTrack failed:', e);
+      }
+    }
+  }
 
+  /**
+   * Remove a track of kind ('audio' or 'video') from all peer connections.
+   */
+  removeTrackFromPeers(kind) {
     for (const [, pc] of this.peerConnections) {
       const senders = pc.getSenders();
-      const audioSender = senders.find((s) => s.track && s.track.kind === 'audio');
-      if (audioSender && trackToSend) {
+      const sender = senders.find((s) => s.track && s.track.kind === kind);
+      if (sender) {
         try {
-          await audioSender.replaceTrack(trackToSend);
+          pc.removeTrack(sender);
         } catch (e) {
-          console.warn('[WebRTC] replaceTrack audio failed:', e);
+          console.warn('[WebRTC] removeTrack failed:', e);
         }
       }
     }
   }
 
   /**
-   * Swap out the video track across all active peer connections.
-   * If track is null, swaps back to dummyVideoTrack (black canvas).
+   * Replace the video track directly (e.g. for screen sharing).
    */
-  async setVideoTrack(track, fallbackDummyTrack) {
-    const trackToSend = track || fallbackDummyTrack;
-    this.currentVideoTrack = trackToSend;
-
+  async replaceVideoTrack(newTrack) {
     for (const [, pc] of this.peerConnections) {
       const senders = pc.getSenders();
       const videoSender = senders.find((s) => s.track && s.track.kind === 'video');
-      if (videoSender && trackToSend) {
+      if (videoSender && newTrack) {
         try {
-          await videoSender.replaceTrack(trackToSend);
+          await videoSender.replaceTrack(newTrack);
         } catch (e) {
           console.warn('[WebRTC] replaceTrack video failed:', e);
+        }
+      } else if (newTrack) {
+        try {
+          pc.addTrack(newTrack, this.localStream);
+        } catch (e) {
+          console.warn('[WebRTC] addTrack video failed:', e);
+        }
+      } else if (videoSender && !newTrack) {
+        try {
+          pc.removeTrack(videoSender);
+        } catch (e) {
+          console.warn('[WebRTC] removeTrack video failed:', e);
         }
       }
     }
