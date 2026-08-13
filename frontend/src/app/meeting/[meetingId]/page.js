@@ -12,7 +12,7 @@ import ParticipantPanel from '@/components/ParticipantPanel';
 import ChatPanel from '@/components/ChatPanel';
 import InviteModal from '@/components/InviteModal';
 import LeaveModal from '@/components/LeaveModal';
-import { WebRTCManager } from '@/lib/webrtc';
+import { WebRTCManager, createDummyTracks } from '@/lib/webrtc';
 
 /** Renders a remote peer's stream — using a dedicated audio element for guaranteed audio playback */
 function RemoteVideo({ stream, isVideoOn = true, style, muted }) {
@@ -89,6 +89,9 @@ export default function MeetingRoom(props) {
   const videoRef = useRef(null);
   const audioStreamRef = useRef(null);
   const videoStreamRef = useRef(null);
+  const dummyAudioTrackRef = useRef(null);
+  const dummyVideoTrackRef = useRef(null);
+  const baseStreamRef = useRef(null);
   
   // UI State
   const [showParticipants, setShowParticipants] = useState(false);
@@ -254,9 +257,9 @@ export default function MeetingRoom(props) {
     };
   }, [currentUser, meetingId, fetchMeetingData]);
 
-  // WebRTC Initialization — create peer connections as soon as socket and user are ready
+  // WebRTC Initialization — create peer connections as soon as socket, user, and dummy baseStream are ready
   useEffect(() => {
-    if (!currentUser || !socketRef.current) return;
+    if (!currentUser || !socketRef.current || !baseStreamRef.current) return;
     
     const ws = socketRef.current;
     const mgr = new WebRTCManager();
@@ -266,6 +269,9 @@ export default function MeetingRoom(props) {
       mgr.init({
         ws,
         clientId: currentUser.id,
+        baseStream: baseStreamRef.current,
+        initialAudioTrack: dummyAudioTrackRef.current,
+        initialVideoTrack: dummyVideoTrackRef.current,
         onRemoteStreamsChanged: (streams) => setRemoteStreams(streams),
       });
       // Small delay to ensure other peers' WebSockets are ready
@@ -307,10 +313,13 @@ export default function MeetingRoom(props) {
     }
   };
 
-  // Ensure localStream object exists for local video tag binding
+  // Initialize in-memory dummy silent audio and black canvas stream (0 hardware mic/cam access)
   useEffect(() => {
-    const stream = new MediaStream();
-    setLocalStream(stream);
+    const { dummyStream, dummyAudioTrack, dummyVideoTrack } = createDummyTracks();
+    dummyAudioTrackRef.current = dummyAudioTrack;
+    dummyVideoTrackRef.current = dummyVideoTrack;
+    baseStreamRef.current = dummyStream;
+    setLocalStream(dummyStream);
 
     return () => {
       if (audioStreamRef.current) {
@@ -366,7 +375,7 @@ export default function MeetingRoom(props) {
         audioStreamRef.current = null;
       }
       if (webrtcRef.current) {
-        await webrtcRef.current.setAudioTrack(null);
+        await webrtcRef.current.setAudioTrack(null, dummyAudioTrackRef.current);
       }
     } else {
       // Request microphone hardware access
@@ -384,7 +393,7 @@ export default function MeetingRoom(props) {
           localStream.addTrack(track);
         }
         if (webrtcRef.current && track) {
-          await webrtcRef.current.setAudioTrack(track);
+          await webrtcRef.current.setAudioTrack(track, dummyAudioTrackRef.current);
         }
       } catch (err) {
         console.error('Failed to get microphone access:', err);
@@ -417,7 +426,7 @@ export default function MeetingRoom(props) {
         videoStreamRef.current = null;
       }
       if (webrtcRef.current) {
-        await webrtcRef.current.setVideoTrack(null);
+        await webrtcRef.current.setVideoTrack(null, dummyVideoTrackRef.current);
       }
     } else {
       // Request camera hardware access
@@ -429,7 +438,7 @@ export default function MeetingRoom(props) {
           localStream.addTrack(track);
         }
         if (webrtcRef.current && track) {
-          await webrtcRef.current.setVideoTrack(track);
+          await webrtcRef.current.setVideoTrack(track, dummyVideoTrackRef.current);
         }
       } catch (err) {
         console.error('Failed to get camera access:', err);
@@ -454,13 +463,13 @@ export default function MeetingRoom(props) {
 
   const handleShareScreen = async () => {
     if (screenStream) {
-      // Stop sharing — restore camera track if active, or null if camera is off
+      // Stop sharing — restore camera track if active, or dummy track if camera is off
       screenStream.getTracks().forEach(track => track.stop());
       setScreenStream(null);
       
       const camTrack = videoStreamRef.current?.getVideoTracks()[0] || null;
       if (webrtcRef.current) {
-        await webrtcRef.current.setVideoTrack(camTrack);
+        await webrtcRef.current.setVideoTrack(camTrack, dummyVideoTrackRef.current);
       }
       if (socketRef.current?.readyState === WebSocket.OPEN) {
         socketRef.current.send(JSON.stringify({ type: 'screen_share_stop', clientId: currentUser.id }));
@@ -473,7 +482,7 @@ export default function MeetingRoom(props) {
         
         const screenTrack = stream.getVideoTracks()[0];
         if (webrtcRef.current) {
-          await webrtcRef.current.setVideoTrack(screenTrack);
+          await webrtcRef.current.setVideoTrack(screenTrack, dummyVideoTrackRef.current);
         }
         if (socketRef.current?.readyState === WebSocket.OPEN) {
           socketRef.current.send(JSON.stringify({ type: 'screen_share_start', clientId: currentUser.id }));
@@ -484,7 +493,7 @@ export default function MeetingRoom(props) {
           setScreenStream(null);
           const camTrack = videoStreamRef.current?.getVideoTracks()[0] || null;
           if (webrtcRef.current) {
-            await webrtcRef.current.setVideoTrack(camTrack);
+            await webrtcRef.current.setVideoTrack(camTrack, dummyVideoTrackRef.current);
           }
           if (socketRef.current?.readyState === WebSocket.OPEN) {
             socketRef.current.send(JSON.stringify({ type: 'screen_share_stop', clientId: currentUser.id }));
