@@ -12,7 +12,7 @@ A full-stack video conferencing platform clone replicating Zoom's design, user e
 - **Instant Meetings**: Create a meeting instantly and generate a shareable ID.
 - **Schedule Meetings**: Schedule meetings for a later date and time.
 - **Join Meeting**: Join by Meeting ID with a custom display name.
-- **Meeting Room**:  mute/unmute, start/stop video, and host controls (Mute All, Remove Participant).
+- **Meeting Room**:  mute/unmute, start/stop video, share screen and host controls (Mute All, Remove Participant).
 
 ## Setup Instructions
 
