@@ -48,5 +48,4 @@ npm run dev
 
 ## Assumptions & Simplifications
 - **Authentication**: No login required. A default host user is assumed and seeded into the DB.
-- **Video/Audio Streaming**: The meeting room simulates a video grid using CSS and participant data. WebRTC/Socket.io implementation for actual video streaming is omitted to focus on the UI/UX and management workflows as requested.
 - **Timezones**: Scheduled meetings are stored in UTC and displayed in the user's local timezone.
