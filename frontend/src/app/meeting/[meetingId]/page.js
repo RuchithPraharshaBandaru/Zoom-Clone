@@ -81,16 +81,14 @@ export default function MeetingRoom(props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   
-  // Local user state — Muted and Video Off by default
-  // We request real getUserMedia on mount but immediately disable tracks.
-  // This ensures the SDP offer contains real m=audio and m=video lines
-  // which is REQUIRED for cross-device WebRTC to work.
+  // Local user state — Muted and Video Off by default (Hardware is completely OFF on join)
   const [isMuted, setIsMuted] = useState(true);
   const [isVideoOn, setIsVideoOn] = useState(false);
   const [localStream, setLocalStream] = useState(null);
-  const [mediaReady, setMediaReady] = useState(false);
   const isLeavingRef = useRef(false);
   const videoRef = useRef(null);
+  const audioStreamRef = useRef(null);
+  const videoStreamRef = useRef(null);
   
   // UI State
   const [showParticipants, setShowParticipants] = useState(false);
@@ -256,9 +254,9 @@ export default function MeetingRoom(props) {
     };
   }, [currentUser, meetingId, fetchMeetingData]);
 
-  // WebRTC Initialization — create peer connections when media + socket are ready
+  // WebRTC Initialization — create peer connections as soon as socket and user are ready
   useEffect(() => {
-    if (!localStream || !mediaReady || !currentUser || !socketRef.current) return;
+    if (!currentUser || !socketRef.current) return;
     
     const ws = socketRef.current;
     const mgr = new WebRTCManager();
@@ -267,12 +265,11 @@ export default function MeetingRoom(props) {
     const initWebRTC = () => {
       mgr.init({
         ws,
-        localStream,
         clientId: currentUser.id,
         onRemoteStreamsChanged: (streams) => setRemoteStreams(streams),
       });
       // Small delay to ensure other peers' WebSockets are ready
-      setTimeout(() => mgr.announceJoin(), 800);
+      setTimeout(() => mgr.announceJoin(), 600);
     };
     
     if (ws.readyState === WebSocket.OPEN) {
@@ -285,7 +282,7 @@ export default function MeetingRoom(props) {
       mgr.cleanup();
       webrtcRef.current = null;
     };
-  }, [localStream, mediaReady, currentUser]);
+  }, [currentUser]);
 
   const handleSendMessage = (text) => {
     const newMessage = {
@@ -310,65 +307,17 @@ export default function MeetingRoom(props) {
     }
   };
 
-  // Initialize REAL local media stream on mount.
-  // We request mic + camera, then immediately disable both tracks.
-  // This gives us a genuine MediaStream with real audio/video tracks
-  // so WebRTC SDP offers include proper m=audio and m=video lines.
-  // Without real tracks, cross-network peers cannot exchange media.
+  // Ensure localStream object exists for local video tag binding
   useEffect(() => {
-    let cancelled = false;
-    let acquiredStream = null;
-
-    const acquireMedia = async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-          video: true,
-        });
-        if (cancelled) {
-          stream.getTracks().forEach(t => t.stop());
-          return;
-        }
-        acquiredStream = stream;
-
-        // Immediately disable both tracks (user starts muted + camera off)
-        stream.getAudioTracks().forEach(t => { t.enabled = false; });
-        stream.getVideoTracks().forEach(t => { t.enabled = false; });
-
-        setLocalStream(stream);
-        setMediaReady(true);
-      } catch (err) {
-        console.warn('[Media] getUserMedia failed, trying audio-only:', err);
-        try {
-          const audioOnly = await navigator.mediaDevices.getUserMedia({ audio: true });
-          if (cancelled) {
-            audioOnly.getTracks().forEach(t => t.stop());
-            return;
-          }
-          acquiredStream = audioOnly;
-          audioOnly.getAudioTracks().forEach(t => { t.enabled = false; });
-          setLocalStream(audioOnly);
-          setMediaReady(true);
-        } catch (err2) {
-          console.error('[Media] No media devices available:', err2);
-          // Fallback: empty stream (WebRTC will use transceivers)
-          const empty = new MediaStream();
-          setLocalStream(empty);
-          setMediaReady(true);
-        }
-      }
-    };
-
-    acquireMedia();
+    const stream = new MediaStream();
+    setLocalStream(stream);
 
     return () => {
-      cancelled = true;
-      if (acquiredStream) {
-        acquiredStream.getTracks().forEach(t => t.stop());
+      if (audioStreamRef.current) {
+        audioStreamRef.current.getTracks().forEach(t => t.stop());
+      }
+      if (videoStreamRef.current) {
+        videoStreamRef.current.getTracks().forEach(t => t.stop());
       }
     };
   }, []);
@@ -402,16 +351,45 @@ export default function MeetingRoom(props) {
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
+  // Toggle Microphone — Only requests microphone hardware when unmuting
   const handleToggleMute = async () => {
     const nextMuted = !isMuted;
     setIsMuted(nextMuted);
 
-    // Simply toggle track.enabled — the track stays in the SDP/RTP stream.
-    // enabled=false sends silence frames, enabled=true sends real audio.
-    if (localStream) {
-      localStream.getAudioTracks().forEach(track => {
-        track.enabled = !nextMuted;
-      });
+    if (nextMuted) {
+      // Stop and release microphone hardware
+      if (audioStreamRef.current) {
+        audioStreamRef.current.getTracks().forEach(track => {
+          track.stop();
+          if (localStream) localStream.removeTrack(track);
+        });
+        audioStreamRef.current = null;
+      }
+      if (webrtcRef.current) {
+        await webrtcRef.current.setAudioTrack(null);
+      }
+    } else {
+      // Request microphone hardware access
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          }
+        });
+        audioStreamRef.current = stream;
+        const track = stream.getAudioTracks()[0];
+        if (localStream && track) {
+          localStream.addTrack(track);
+        }
+        if (webrtcRef.current && track) {
+          await webrtcRef.current.setAudioTrack(track);
+        }
+      } catch (err) {
+        console.error('Failed to get microphone access:', err);
+        setIsMuted(true);
+      }
     }
 
     if (currentUser) {
@@ -424,15 +402,39 @@ export default function MeetingRoom(props) {
     }
   };
 
+  // Toggle Camera — Only requests camera hardware when starting video
   const handleToggleVideo = async () => {
     const nextVideoOn = !isVideoOn;
     setIsVideoOn(nextVideoOn);
 
-    // Simply toggle track.enabled — sends black frames when disabled.
-    if (localStream) {
-      localStream.getVideoTracks().forEach(track => {
-        track.enabled = nextVideoOn;
-      });
+    if (!nextVideoOn) {
+      // Stop and release camera hardware (turns off webcam light)
+      if (videoStreamRef.current) {
+        videoStreamRef.current.getTracks().forEach(track => {
+          track.stop();
+          if (localStream) localStream.removeTrack(track);
+        });
+        videoStreamRef.current = null;
+      }
+      if (webrtcRef.current) {
+        await webrtcRef.current.setVideoTrack(null);
+      }
+    } else {
+      // Request camera hardware access
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        videoStreamRef.current = stream;
+        const track = stream.getVideoTracks()[0];
+        if (localStream && track) {
+          localStream.addTrack(track);
+        }
+        if (webrtcRef.current && track) {
+          await webrtcRef.current.setVideoTrack(track);
+        }
+      } catch (err) {
+        console.error('Failed to get camera access:', err);
+        setIsVideoOn(false);
+      }
     }
 
     if (currentUser) {
@@ -452,13 +454,13 @@ export default function MeetingRoom(props) {
 
   const handleShareScreen = async () => {
     if (screenStream) {
-      // Stop sharing — switch back to camera track
+      // Stop sharing — restore camera track if active, or null if camera is off
       screenStream.getTracks().forEach(track => track.stop());
       setScreenStream(null);
       
-      const camTrack = localStream?.getVideoTracks()[0] || null;
+      const camTrack = videoStreamRef.current?.getVideoTracks()[0] || null;
       if (webrtcRef.current) {
-        await webrtcRef.current.replaceVideoTrack(camTrack);
+        await webrtcRef.current.setVideoTrack(camTrack);
       }
       if (socketRef.current?.readyState === WebSocket.OPEN) {
         socketRef.current.send(JSON.stringify({ type: 'screen_share_stop', clientId: currentUser.id }));
@@ -471,7 +473,7 @@ export default function MeetingRoom(props) {
         
         const screenTrack = stream.getVideoTracks()[0];
         if (webrtcRef.current) {
-          await webrtcRef.current.replaceVideoTrack(screenTrack);
+          await webrtcRef.current.setVideoTrack(screenTrack);
         }
         if (socketRef.current?.readyState === WebSocket.OPEN) {
           socketRef.current.send(JSON.stringify({ type: 'screen_share_start', clientId: currentUser.id }));
@@ -480,9 +482,9 @@ export default function MeetingRoom(props) {
         // Listen for when user stops sharing via browser UI
         screenTrack.onended = async () => {
           setScreenStream(null);
-          const camTrack = localStream?.getVideoTracks()[0] || null;
+          const camTrack = videoStreamRef.current?.getVideoTracks()[0] || null;
           if (webrtcRef.current) {
-            await webrtcRef.current.replaceVideoTrack(camTrack);
+            await webrtcRef.current.setVideoTrack(camTrack);
           }
           if (socketRef.current?.readyState === WebSocket.OPEN) {
             socketRef.current.send(JSON.stringify({ type: 'screen_share_stop', clientId: currentUser.id }));
