@@ -1,12 +1,11 @@
 /**
- * WebRTCManager — Manages peer-to-peer video/audio connections
- * using WebRTC with the FastAPI WebSocket as the signaling server.
+ * WebRTCManager — Robust Peer-to-Peer Video/Audio Connection Engine.
  * 
  * Features:
- * - Comprehensive STUN server pool for cross-device NAT traversal
- * - Queued ICE candidate handling (prevents candidates dropping before remote description is set)
- * - Safe auto-renegotiation with glare protection
- * - Audio & video track synchronization across different devices and networks
+ * - Bidirectional 'sendrecv' audio & video transceivers in all peer connections
+ * - Guaranteed track addition/replacement for on-demand mic and camera toggles
+ * - Queued ICE candidates to prevent dropped packets during cross-device handshakes
+ * - Extensive multi-region STUN server pool
  */
 
 const ICE_SERVERS = [
@@ -31,42 +30,34 @@ export class WebRTCManager {
     this.clientId = null;
     this.onRemoteStreamsChanged = null;
     this.currentVideoTrack = null;
-    this.currentVideoStream = null;
+    this.currentAudioTrack = null;
     this._negotiating = new Set();
   }
 
-  /**
-   * Initialize the manager with a WebSocket, local media stream,
-   * and a callback that fires whenever remote streams change.
-   */
   init({ ws, localStream, clientId, onRemoteStreamsChanged }) {
     this.ws = ws;
     this.localStream = localStream;
     this.clientId = String(clientId);
     this.onRemoteStreamsChanged = onRemoteStreamsChanged;
+
+    if (localStream) {
+      this.currentAudioTrack = localStream.getAudioTracks()[0] || null;
+      this.currentVideoTrack = localStream.getVideoTracks()[0] || null;
+    }
   }
 
-  /** Send a JSON message over the signaling WebSocket */
   send(data) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
     }
   }
 
-  /** Announce our presence so existing peers can initiate connections */
   announceJoin() {
     this.send({ type: 'webrtc_join', clientId: this.clientId });
   }
 
-  /**
-   * Route an incoming signaling message to the correct handler.
-   * Messages with a `targetId` are only processed if they match our clientId.
-   */
   async handleMessage(data) {
-    // Ignore our own messages
     if (String(data.clientId) === this.clientId) return;
-
-    // If the message has a targetId, only process if it's for us
     if (data.targetId && String(data.targetId) !== this.clientId) return;
 
     const remoteId = String(data.clientId);
@@ -93,9 +84,7 @@ export class WebRTCManager {
     }
   }
 
-  /** Create an RTCPeerConnection for a remote peer */
   createPeerConnection(remoteId) {
-    // Close any existing connection to this peer
     if (this.peerConnections.has(remoteId)) {
       try {
         this.peerConnections.get(remoteId).close();
@@ -109,27 +98,26 @@ export class WebRTCManager {
       iceCandidatePoolSize: 10,
     });
 
-    // Initialize ICE queue for this peer
     if (!this.iceQueues.has(remoteId)) {
       this.iceQueues.set(remoteId, []);
     }
 
-    // Add local tracks
-    if (this.localStream) {
-      this.localStream.getAudioTracks().forEach((track) => {
-        pc.addTrack(track, this.localStream);
-      });
+    // Always create sendrecv transceivers for audio & video
+    const audioTrack = this.currentAudioTrack || (this.localStream ? this.localStream.getAudioTracks()[0] : null);
+    const videoTrack = this.currentVideoTrack || (this.localStream ? this.localStream.getVideoTracks()[0] : null);
 
-      if (this.currentVideoTrack) {
-        pc.addTrack(this.currentVideoTrack, this.currentVideoStream || this.localStream);
-      } else {
-        this.localStream.getVideoTracks().forEach((track) => {
-          pc.addTrack(track, this.localStream);
-        });
-      }
+    if (audioTrack && this.localStream) {
+      pc.addTrack(audioTrack, this.localStream);
+    } else {
+      pc.addTransceiver('audio', { direction: 'sendrecv' });
     }
 
-    // Handle renegotiation
+    if (videoTrack && this.localStream) {
+      pc.addTrack(videoTrack, this.localStream);
+    } else {
+      pc.addTransceiver('video', { direction: 'sendrecv' });
+    }
+
     pc.onnegotiationneeded = async () => {
       if (this._negotiating.has(remoteId)) return;
       this._negotiating.add(remoteId);
@@ -148,13 +136,12 @@ export class WebRTCManager {
           offer: pc.localDescription,
         });
       } catch (err) {
-        console.warn('Renegotiation failed (safe to ignore):', err.message);
+        console.warn('Renegotiation failed:', err);
       } finally {
         this._negotiating.delete(remoteId);
       }
     };
 
-    // When we discover a new ICE candidate, send it immediately
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         this.send({
@@ -166,11 +153,9 @@ export class WebRTCManager {
       }
     };
 
-    // When remote tracks arrive, store the stream and notify React
     pc.ontrack = (event) => {
       let stream = event.streams && event.streams[0];
       if (!stream) {
-        // Fallback: create a MediaStream from received track
         if (!this.remoteStreams.has(remoteId)) {
           stream = new MediaStream();
           this.remoteStreams.set(remoteId, stream);
@@ -184,7 +169,6 @@ export class WebRTCManager {
       this.notifyStreamsChanged();
     };
 
-    // Monitor connection health
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
       if (state === 'disconnected' || state === 'failed' || state === 'closed') {
@@ -196,7 +180,6 @@ export class WebRTCManager {
     return pc;
   }
 
-  /** Drain queued ICE candidates once remote description is set */
   async drainIceCandidates(remoteId, pc) {
     const queue = this.iceQueues.get(remoteId) || [];
     while (queue.length > 0) {
@@ -209,7 +192,6 @@ export class WebRTCManager {
     }
   }
 
-  /** Create and send an SDP offer to a remote peer */
   async createOffer(remoteId) {
     this._negotiating.add(remoteId);
     try {
@@ -227,13 +209,11 @@ export class WebRTCManager {
     }
   }
 
-  /** Handle an incoming SDP offer — create connection, set remote desc, send answer */
   async handleOffer(remoteId, offer) {
     this._negotiating.add(remoteId);
     try {
       const pc = this.createPeerConnection(remoteId);
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      // Drain any ICE candidates received before the offer
       await this.drainIceCandidates(remoteId, pc);
 
       const answer = await pc.createAnswer();
@@ -249,21 +229,18 @@ export class WebRTCManager {
     }
   }
 
-  /** Handle an incoming SDP answer — complete the connection */
   async handleAnswer(remoteId, answer) {
     const pc = this.peerConnections.get(remoteId);
     if (pc) {
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(answer));
-        // Drain any ICE candidates received before the answer
         await this.drainIceCandidates(remoteId, pc);
       } catch (err) {
-        console.warn('Failed to set remote description:', err.message);
+        console.warn('Failed to set remote description:', err);
       }
     }
   }
 
-  /** Handle an incoming ICE candidate (with queuing if remote description is not set yet) */
   async handleIceCandidate(remoteId, candidate) {
     if (!candidate) return;
     const pc = this.peerConnections.get(remoteId);
@@ -275,7 +252,6 @@ export class WebRTCManager {
         console.warn('Failed to add ICE candidate directly:', e);
       }
     } else {
-      // Queue candidate until setRemoteDescription is called
       if (!this.iceQueues.has(remoteId)) {
         this.iceQueues.set(remoteId, []);
       }
@@ -283,12 +259,10 @@ export class WebRTCManager {
     }
   }
 
-  /** Notify the React component that remote streams have changed */
   notifyStreamsChanged() {
     this.onRemoteStreamsChanged?.(new Map(this.remoteStreams));
   }
 
-  /** Remove a peer and clean up its connection */
   removePeer(remoteId) {
     const pc = this.peerConnections.get(remoteId);
     if (pc) {
@@ -303,7 +277,6 @@ export class WebRTCManager {
     this.notifyStreamsChanged();
   }
 
-  /** Tear down all connections */
   cleanup() {
     this.peerConnections.forEach((pc) => {
       try {
@@ -316,37 +289,54 @@ export class WebRTCManager {
     this._negotiating.clear();
   }
 
-  /** Replace the outgoing video track (e.g. for screen sharing or camera toggle) */
-  async replaceVideoTrack(newTrack, newStream) {
-    this.currentVideoTrack = newTrack;
-    this.currentVideoStream = newStream;
+  /** Replace or set the outgoing audio track (mute/unmute) */
+  async replaceAudioTrack(newTrack, stream) {
+    this.currentAudioTrack = newTrack;
+    if (stream) this.localStream = stream;
 
     for (const [, pc] of this.peerConnections.entries()) {
       const senders = pc.getSenders();
-      const videoSender = senders.find((s) => s.track && s.track.kind === 'video');
+      const audioSender = senders.find((s) => s.track && s.track.kind === 'audio') ||
+        senders.find((s) => !s.track);
 
-      if (videoSender && newTrack) {
-        await videoSender.replaceTrack(newTrack);
-      } else if (!videoSender && newTrack) {
-        pc.addTrack(newTrack, newStream || this.localStream);
-      } else if (videoSender && !newTrack) {
-        await videoSender.replaceTrack(null);
+      if (audioSender) {
+        try {
+          await audioSender.replaceTrack(newTrack);
+        } catch (e) {
+          console.warn('Failed to replace audio track:', e);
+        }
+      } else if (newTrack) {
+        try {
+          pc.addTrack(newTrack, stream || this.localStream);
+        } catch (e) {
+          console.warn('Failed to add audio track:', e);
+        }
       }
     }
   }
 
-  /** Update local stream after mute / unmute */
-  updateLocalStream(newStream) {
-    this.localStream = newStream;
+  /** Replace or set the outgoing video track (camera toggle or screen share) */
+  async replaceVideoTrack(newTrack, stream) {
+    this.currentVideoTrack = newTrack;
+    if (stream) this.localStream = stream;
+
     for (const [, pc] of this.peerConnections.entries()) {
       const senders = pc.getSenders();
-      const audioSender = senders.find((s) => s.track && s.track.kind === 'audio');
-      const audioTrack = newStream?.getAudioTracks()[0] || null;
+      const videoSender = senders.find((s) => s.track && s.track.kind === 'video') ||
+        senders.find((s) => !s.track);
 
-      if (audioSender && audioTrack) {
-        audioSender.replaceTrack(audioTrack);
-      } else if (!audioSender && audioTrack) {
-        pc.addTrack(audioTrack, newStream);
+      if (videoSender) {
+        try {
+          await videoSender.replaceTrack(newTrack);
+        } catch (e) {
+          console.warn('Failed to replace video track:', e);
+        }
+      } else if (newTrack) {
+        try {
+          pc.addTrack(newTrack, stream || this.localStream);
+        } catch (e) {
+          console.warn('Failed to add video track:', e);
+        }
       }
     }
   }
